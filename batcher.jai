@@ -6,12 +6,13 @@ BatcherVertex :: struct {
 
 BatcherPerTriangleData :: struct {
     /*
-        First 24 bits is packed color R5 G6 B5 A8 (see `pack_rgba_to_rgb16_a8()`)
-        Bits 24..27: texture index, or 15 for untextured triangles.
-        Bit 28: `anti_alias_nearest_neighbour` flag.
-        Bits 29..31 are zero.
+        Bits 0..3: texture index, or 15 for untextured triangles.
+        Bit 4: `anti_alias_nearest_neighbour` flag.
+        Bits 5..31 are zero.
     */
     packed_data: u32;
+    // RGBA8: R in bits 0..7, G in 8..15, B in 16..23, A in 24..31.
+    packed_color: u32;
 }
 
 BatcherObjectTransformData :: struct {
@@ -94,11 +95,11 @@ register_texture :: (batcher: *Batcher, texture: u64) -> u8 {
 
 #scope_module
 
-pack_batcher_per_triangle_data :: inline (color: Color, texture_index: u8, anti_alias_nearest_neighbour: bool) -> u32 {
+pack_batcher_per_triangle_data :: inline (color: Color, texture_index: u8, anti_alias_nearest_neighbour: bool) -> BatcherPerTriangleData {
     assert(texture_index < BATCHER_MAX_TEXTURE_COUNT || texture_index == BATCHER_INVALID_TEXTURE_INDEX);
     texture_bits := cast(u32) texture_index;
     aa_bits := cast(u32) anti_alias_nearest_neighbour;
-    return pack_rgba_to_rgb16_a8(color) | (texture_bits << 24) | (aa_bits << 28);
+    return .{packed_data = texture_bits | (aa_bits << 4), packed_color = color.rgba};
 }
 
 push_quad_manual :: (batcher: *Batcher,
@@ -125,8 +126,7 @@ push_quad_manual :: (batcher: *Batcher,
 
     anti_alias_nearest_neighbour: bool = (texture_flags & .ANTIALIAS_NEAREST_NEIGHBOUR) != 0;
 
-    per_triangle_data: BatcherPerTriangleData;
-    per_triangle_data.packed_data = pack_batcher_per_triangle_data(color, texture_index, anti_alias_nearest_neighbour);
+    per_triangle_data := pack_batcher_per_triangle_data(color, texture_index, anti_alias_nearest_neighbour);
 
     array_add(*batcher.per_triangle_data, per_triangle_data, per_triangle_data);
 }
@@ -174,8 +174,7 @@ push_triangle_internal :: (batcher: *Batcher, p0: Vec2, p1: Vec2, p2: Vec2, tran
     array_add(*batcher.vertices, vertices[0], vertices[1], vertices[2]);
     array_add(*batcher.indices, base_vertex, base_vertex + 1, base_vertex + 2);
 
-    data: BatcherPerTriangleData;
-    data.packed_data = pack_batcher_per_triangle_data(color, xx BATCHER_INVALID_TEXTURE_INDEX, false);
+    data := pack_batcher_per_triangle_data(color, xx BATCHER_INVALID_TEXTURE_INDEX, false);
     array_add(*batcher.per_triangle_data, data);
 }
 
@@ -267,8 +266,7 @@ push_mesh_2d :: (batcher: *Batcher, mesh: Mesh2D, transform: Transform2D, color:
     }
 
     // push per triangle data
-    data: BatcherPerTriangleData;
-    data.packed_data = pack_batcher_per_triangle_data(color, xx BATCHER_INVALID_TEXTURE_INDEX, false);
+    data := pack_batcher_per_triangle_data(color, xx BATCHER_INVALID_TEXTURE_INDEX, false);
 
     for 0..triangle_count-1 {
         array_add(*batcher.per_triangle_data, data);
