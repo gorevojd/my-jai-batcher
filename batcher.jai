@@ -102,6 +102,7 @@ pack_batcher_per_triangle_data :: inline (color: Color, texture_index: u8, anti_
     return .{packed_data = texture_bits | (aa_bits << 4), packed_color = color.rgba};
 }
 
+#scope_export
 push_quad_manual :: (batcher: *Batcher,
                      ps: [] BatcherVertex,
                      transform_index: u32,
@@ -131,6 +132,7 @@ push_quad_manual :: (batcher: *Batcher,
     array_add(*batcher.per_triangle_data, per_triangle_data, per_triangle_data);
 }
 
+#scope_module
 get_quad_vertex_data_for_rect_points :: inline (points: [] Vec2) -> [4] BatcherVertex #no_abc {
     quad_data: [4] BatcherVertex = .[
         .{point=points[0], uv=.{0.0, 1.0}},
@@ -142,6 +144,7 @@ get_quad_vertex_data_for_rect_points :: inline (points: [] Vec2) -> [4] BatcherV
     return quad_data;
 }
 
+#scope_export
 register_transform :: inline (batcher: *Batcher, position: Vec2, rotation: float, scale: float = 1.0) -> u32 {
     return register_transform(batcher, position, complex_from_angle(rotation), scale);
 }
@@ -155,6 +158,7 @@ register_transform :: inline (batcher: *Batcher, position: Vec2, rotation: Compl
     return result;
 }
 
+#scope_module
 push_polygon_internal :: (batcher: *Batcher,
                           ps: [4] Vec2,
                           transform_index: u32,
