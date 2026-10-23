@@ -6,6 +6,7 @@
 
 #scope_export
 #load "batcher.jai";
+#load "batcher_color_glsl.jai";
 
 #if IMPORT_OGL_IMPLEMENTATION {
     #scope_module

@@ -11,6 +11,8 @@ OGL_BatcherCache :: struct {
     transform_texture: u32;
     shader_program: u32;
     projection_uniform: s32 = -1;
+    color_pack_mode_uniform: s32 = -1;
+    color_pack_mode: ColorPackMode = .PACK_U64;
 
     // Allocated sizes in bytes. Storage grows as needed and survives frame resets.
     vertex_buffer_capacity: int;
@@ -23,7 +25,9 @@ OGL_BatcherCache :: struct {
 ogl_init_batcher :: (cache: *OGL_BatcherCache) -> bool {
     assert(cache.vao == 0 && cache.shader_program == 0, "Batcher cache is already initialized.");
     cache.shader_program = ogl_batcher_create_program();
-    if cache.shader_program == 0 return false;
+    if cache.shader_program == 0 {
+        return false;
+    }
 
     glGenVertexArrays(1, *cache.vao);
     glGenBuffers(1, *cache.vertex_buffer);
@@ -47,22 +51,48 @@ ogl_init_batcher :: (cache: *OGL_BatcherCache) -> bool {
     glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, stride, *offset.transform_index);
 
     // Allocate the texture buffers before attaching their persistent texture views.
-    ogl_batcher_upload_buffer(cache.per_triangle_buffer, GL_TEXTURE_BUFFER, null, 256, *cache.per_triangle_buffer_capacity);
+    ogl_batcher_upload_buffer(
+        cache.per_triangle_buffer,
+        GL_TEXTURE_BUFFER,
+        null,
+        256,
+        *cache.per_triangle_buffer_capacity
+    );
     glActiveTexture(GL_TEXTURE0 + BATCHER_MAX_TEXTURE_COUNT);
     glBindTexture(GL_TEXTURE_BUFFER, cache.per_triangle_texture);
-    glTexBuffer(GL_TEXTURE_BUFFER, GL_RG32UI, cache.per_triangle_buffer);
-    ogl_batcher_upload_buffer(cache.transform_buffer, GL_TEXTURE_BUFFER, null, 256, *cache.transform_buffer_capacity);
+    glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32UI, cache.per_triangle_buffer);
+    cache.color_pack_mode = .PACK_U64;
+    ogl_batcher_upload_buffer(
+        cache.transform_buffer,
+        GL_TEXTURE_BUFFER,
+        null,
+        256,
+        *cache.transform_buffer_capacity
+    );
     glActiveTexture(GL_TEXTURE0 + BATCHER_MAX_TEXTURE_COUNT + 1);
     glBindTexture(GL_TEXTURE_BUFFER, cache.transform_texture);
     glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, cache.transform_buffer);
 
     glUseProgram(cache.shader_program);
     cache.projection_uniform = glGetUniformLocation(cache.shader_program, "projection".data);
+    cache.color_pack_mode_uniform = glGetUniformLocation(cache.shader_program, "color_pack_mode".data);
     texture_units: [BATCHER_MAX_TEXTURE_COUNT] GLint;
-    for i: 0..texture_units.count-1 texture_units[i] = xx i;
-    glUniform1iv(glGetUniformLocation(cache.shader_program, "textures[0]".data), xx texture_units.count, texture_units.data);
-    glUniform1i(glGetUniformLocation(cache.shader_program, "per_triangle_data".data), BATCHER_MAX_TEXTURE_COUNT);
-    glUniform1i(glGetUniformLocation(cache.shader_program, "object_transform_data".data), BATCHER_MAX_TEXTURE_COUNT + 1);
+    for i: 0..texture_units.count-1 {
+        texture_units[i] = xx i;
+    }
+    glUniform1iv(
+        glGetUniformLocation(cache.shader_program, "textures[0]".data),
+        xx texture_units.count,
+        texture_units.data
+    );
+    glUniform1i(
+        glGetUniformLocation(cache.shader_program, "per_triangle_data".data),
+        BATCHER_MAX_TEXTURE_COUNT
+    );
+    glUniform1i(
+        glGetUniformLocation(cache.shader_program, "object_transform_data".data),
+        BATCHER_MAX_TEXTURE_COUNT + 1
+    );
 
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -82,7 +112,9 @@ ogl_destroy_batcher :: (cache: *OGL_BatcherCache) {
     if cache.shader_program != 0 {
         current_program: GLint;
         glGetIntegerv(GL_CURRENT_PROGRAM, *current_program);
-        if cast(u32) current_program == cache.shader_program glUseProgram(0);
+        if cast(u32) current_program == cache.shader_program {
+            glUseProgram(0);
+        }
         glDeleteProgram(cache.shader_program);
     }
     cache.* = .{};
@@ -90,26 +122,47 @@ ogl_destroy_batcher :: (cache: *OGL_BatcherCache) {
 
 // The caller supplies its camera's matrix, keeping the module independent of application render types.
 ogl_render_batcher :: (cache: *OGL_BatcherCache, batcher: *Batcher, view_projection: *Mat4) {
-    if batcher.indices.count <= 0 return;
+    if batcher.indices.count <= 0 {
+        return;
+    }
     assert(cache.vao != 0 && cache.shader_program != 0, "Initialize the batcher cache before rendering.");
-    assert(batcher.indices.count % 3 == 0 && batcher.per_triangle_data.count == batcher.indices.count / 3);
-    #assert size_of(BatcherPerTriangleData) == 2 * size_of(u32);
+    triangle_data, triangle_data_bytes, triangle_count := get_batcher_triangle_data(batcher);
+    color_pack_mode := get_batcher_color_pack_mode(batcher);
+    assert(batcher.indices.count % 3 == 0 && triangle_count == batcher.indices.count / 3);
     #assert size_of(BatcherObjectTransformData) == 4 * size_of(float);
 
     glBindVertexArray(cache.vao);
-    ogl_batcher_upload_buffer(cache.vertex_buffer, GL_ARRAY_BUFFER, batcher.vertices.data,
-                             batcher.vertices.count * size_of(BatcherVertex), *cache.vertex_buffer_capacity);
-    ogl_batcher_upload_buffer(cache.index_buffer, GL_ELEMENT_ARRAY_BUFFER, batcher.indices.data,
-                             batcher.indices.count * size_of(u32), *cache.index_buffer_capacity);
-    ogl_batcher_upload_buffer(cache.per_triangle_buffer, GL_TEXTURE_BUFFER, batcher.per_triangle_data.data,
-                             batcher.per_triangle_data.count * size_of(BatcherPerTriangleData), *cache.per_triangle_buffer_capacity);
-    ogl_batcher_upload_buffer(cache.transform_buffer, GL_TEXTURE_BUFFER, batcher.object_transform_data.data,
-                             batcher.object_transform_data.count * size_of(BatcherObjectTransformData), *cache.transform_buffer_capacity);
+    ogl_batcher_upload_buffer(
+        cache.vertex_buffer, GL_ARRAY_BUFFER, batcher.vertices.data,
+        batcher.vertices.count * size_of(BatcherVertex), *cache.vertex_buffer_capacity
+    );
+    ogl_batcher_upload_buffer(
+        cache.index_buffer, GL_ELEMENT_ARRAY_BUFFER, batcher.indices.data,
+        batcher.indices.count * size_of(u32), *cache.index_buffer_capacity
+    );
+    ogl_batcher_upload_buffer(
+        cache.per_triangle_buffer, GL_TEXTURE_BUFFER, triangle_data,
+        triangle_data_bytes, *cache.per_triangle_buffer_capacity
+    );
+    ogl_batcher_upload_buffer(
+        cache.transform_buffer, GL_TEXTURE_BUFFER, batcher.object_transform_data.data,
+        batcher.object_transform_data.count * size_of(BatcherObjectTransformData),
+        *cache.transform_buffer_capacity
+    );
 
     glUseProgram(cache.shader_program);
     glUniformMatrix4fv(cache.projection_uniform, 1, GL_TRUE, *view_projection._00);
+    glUniform1i(cache.color_pack_mode_uniform, xx color_pack_mode);
     glActiveTexture(GL_TEXTURE0 + BATCHER_MAX_TEXTURE_COUNT);
     glBindTexture(GL_TEXTURE_BUFFER, cache.per_triangle_texture);
+    if cache.color_pack_mode != color_pack_mode {
+        format: GLenum = GL_RGBA32UI;
+        if color_pack_mode == .PACK_U32 {
+            format = GL_RG32UI;
+        }
+        glTexBuffer(GL_TEXTURE_BUFFER, format, cache.per_triangle_buffer);
+        cache.color_pack_mode = color_pack_mode;
+    }
     glActiveTexture(GL_TEXTURE0 + BATCHER_MAX_TEXTURE_COUNT + 1);
     glBindTexture(GL_TEXTURE_BUFFER, cache.transform_texture);
     for texture_index: 0..batcher.num_textures-1 {
@@ -118,7 +171,7 @@ ogl_render_batcher :: (cache: *OGL_BatcherCache, batcher: *Batcher, view_project
     }
 
     glEnable(GL_BLEND);
-    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDrawElements(GL_TRIANGLES, xx batcher.indices.count, GL_UNSIGNED_INT, null);
     glDisable(GL_BLEND);
     glBindVertexArray(0);
@@ -132,7 +185,9 @@ ogl_batcher_upload_buffer :: (buffer: u32, target: GLenum, data: *void, data_siz
         capacity.* = max(data_size, max(256, capacity.* * 2));
         glBufferData(target, capacity.*, null, GL_STREAM_DRAW);
     }
-    if data != null && data_size > 0 glBufferSubData(target, 0, data_size, data);
+    if data != null && data_size > 0 {
+        glBufferSubData(target, 0, data_size, data);
+    }
 }
 
 ogl_batcher_compile_shader :: (type: GLenum, source: string) -> u32 {
@@ -154,10 +209,14 @@ ogl_batcher_compile_shader :: (type: GLenum, source: string) -> u32 {
 
 ogl_batcher_create_program :: () -> u32 {
     vs := ogl_batcher_compile_shader(GL_VERTEX_SHADER, OGL_BATCHER_VERTEX_SHADER);
-    if vs == 0 return 0;
+    if vs == 0 {
+        return 0;
+    }
     defer glDeleteShader(vs);
     fs := ogl_batcher_compile_shader(GL_FRAGMENT_SHADER, OGL_BATCHER_FRAGMENT_SHADER);
-    if fs == 0 return 0;
+    if fs == 0 {
+        return 0;
+    }
     defer glDeleteShader(fs);
 
     program := glCreateProgram();
@@ -206,25 +265,25 @@ void main()
 
 BATCHER_VS;
 
-OGL_BATCHER_FRAGMENT_SHADER :: #string BATCHER_FS
+OGL_BATCHER_FRAGMENT_SHADER :: #run sprint(
+    "#version 330 core\n%\n%", PACKED_COLOR_GLSL, OGL_BATCHER_FRAGMENT_BODY
+);
 
-#version 330 core
+#scope_module
+OGL_BATCHER_FRAGMENT_BODY :: #string BATCHER_FS
 
 in vec2 vs_uv;
 out vec4 color;
 
 uniform sampler2D textures[14];
 uniform usamplerBuffer per_triangle_data;
+uniform int color_pack_mode;
 
 void main()
 {
-    uvec2 triangle_data = texelFetch(per_triangle_data, gl_PrimitiveID).rg;
+    uvec4 triangle_data = texelFetch(per_triangle_data, gl_PrimitiveID);
     uint packed_data = triangle_data.r;
-    uint packed_color = triangle_data.g;
-    color = vec4(float(packed_color & 255u),
-                 float((packed_color >> 8u) & 255u),
-                 float((packed_color >> 16u) & 255u),
-                 float((packed_color >> 24u) & 255u)) / 255.0;
+    color = unpack_batcher_color(triangle_data, color_pack_mode);
     uint texture_index = packed_data & 15u;
     uint aa_nearest_neighbour = (packed_data >> 4u) & 1u;
 
