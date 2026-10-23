@@ -3,7 +3,6 @@
 #scope_module
 #import "Basic";
 #import "MyMath";
-#import "MyAssets";
 
 #scope_export
 #load "batcher.jai";

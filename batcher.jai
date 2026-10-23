@@ -1,3 +1,14 @@
+BatcherTextureFlags :: enum_flags u32 {
+    ANTIALIAS_NEAREST_NEIGHBOUR;
+}
+
+BatcherTexture :: struct {
+    // Backend-defined handle. The OpenGL implementation expects a GL texture name.
+    handle: u64;
+    width, height: u32;
+    flags: BatcherTextureFlags;
+}
+
 BatcherVertex :: struct {
     point: Vec2;
     uv: Vec2;
@@ -108,7 +119,7 @@ push_quad_manual :: (batcher: *Batcher,
                      transform_index: u32,
                      color: Color,
                      texture_index: u8 = xx BATCHER_INVALID_TEXTURE_INDEX,
-                     texture_flags: Texture_Flags = 0)
+                     texture_flags: BatcherTextureFlags = 0)
 {
     num_before := cast(u32) batcher.vertices.count;
 
@@ -164,7 +175,7 @@ push_polygon_internal :: (batcher: *Batcher,
                           transform_index: u32,
                           color: Color = Colors.WHITE,
                           texture_index: u8 = xx BATCHER_INVALID_TEXTURE_INDEX,
-                          texture_flags: Texture_Flags = 0) #no_abc
+                          texture_flags: BatcherTextureFlags = 0) #no_abc
 {
     quad_data := get_quad_vertex_data_for_rect_points(ps);
     push_quad_manual(batcher, quad_data, transform_index, color, texture_index, texture_flags);
@@ -235,7 +246,7 @@ push_polygon :: (batcher: *Batcher,
                  ps: [4] Vec2,
                  color: Color = Colors.WHITE,
                  texture_index: u8 = xx BATCHER_INVALID_TEXTURE_INDEX,
-                 texture_flags: Texture_Flags = 0) #no_abc
+                 texture_flags: BatcherTextureFlags = 0) #no_abc
 {
     push_polygon_internal(batcher, ps, BATCHER_IDENTITY_TRANSFORM_INDEX, color, texture_index, texture_flags);
 }
@@ -310,7 +321,7 @@ push_rotated_rect_outline :: (batcher: *Batcher,
 }
 
 push_texture :: (batcher: *Batcher,
-                 texture: Texture,
+                 texture: BatcherTexture,
                  position: Vec2,
                  height: float,
                  align: Vec2 = .{0.5, 0.5},
@@ -320,7 +331,7 @@ push_texture :: (batcher: *Batcher,
 }
 
 push_rotated_texture :: (batcher: *Batcher,
-                         texture: Texture,
+                         texture: BatcherTexture,
                          position: Vec2,
                          height: float,
                          rotation_angle: float = 0.0,
@@ -348,7 +359,7 @@ push_rotated_texture :: (batcher: *Batcher,
 }
 
 // Draw an atlas region (normalized UVs) on a local rectangle, transformed as one object.
-push_texture_region :: (batcher: *Batcher, texture: Texture, rect: Rect, uv_rect: Rect,
+push_texture_region :: (batcher: *Batcher, texture: BatcherTexture, rect: Rect, uv_rect: Rect,
                         transform: Transform2D, color: Color = Colors.WHITE) {
     if texture.width == 0 || texture.height == 0 return;
     texture_index := register_texture(batcher, texture.handle);
