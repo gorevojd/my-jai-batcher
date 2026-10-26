@@ -225,10 +225,12 @@ ogl_draw_batcher_ranges :: (batcher: *Batcher, first_triangle_uniform: s32, proj
                 minimum = min(minimum, pixel);
                 maximum = max(maximum, pixel);
             }
-            x0 = max(x0, cast(s32)floor(minimum.x));
-            y0 = max(y0, cast(s32)floor(minimum.y));
-            x1 = min(x1, cast(s32)ceil(maximum.x));
-            y1 = min(y1, cast(s32)ceil(maximum.y));
+            // Scissors have integer pixel edges. Round to the nearest edge so projection
+            // roundoff cannot expand an integer-aligned clip by an entire pixel.
+            x0 = max(x0, cast(s32)floor(minimum.x + 0.5));
+            y0 = max(y0, cast(s32)floor(minimum.y + 0.5));
+            x1 = min(x1, cast(s32)floor(maximum.x + 0.5));
+            y1 = min(y1, cast(s32)floor(maximum.y + 0.5));
         }
         if had_scissor {
             x0 = max(x0, saved_scissor[0]);
