@@ -11,8 +11,9 @@ OGL_BatcherCache :: struct {
     transform_texture: u32;
     shader_program: u32;
     projection_uniform: s32 = -1;
-    color_pack_mode_uniform: s32 = -1;
-    color_pack_mode: ColorPackMode = .PACK_U64;
+    first_triangle_uniform: s32 = -1;
+    material_buffer, material_texture: u32;
+    material_buffer_capacity: int;
 
     // Allocated sizes in bytes. Storage grows as needed and survives frame resets.
     vertex_buffer_capacity: int;
@@ -60,8 +61,7 @@ ogl_init_batcher :: (cache: *OGL_BatcherCache) -> bool {
     );
     glActiveTexture(GL_TEXTURE0 + BATCHER_MAX_TEXTURE_COUNT);
     glBindTexture(GL_TEXTURE_BUFFER, cache.per_triangle_texture);
-    glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32UI, cache.per_triangle_buffer);
-    cache.color_pack_mode = .PACK_U64;
+    glTexBuffer(GL_TEXTURE_BUFFER, GL_RG32UI, cache.per_triangle_buffer);
     ogl_batcher_upload_buffer(
         cache.transform_buffer,
         GL_TEXTURE_BUFFER,
@@ -73,9 +73,16 @@ ogl_init_batcher :: (cache: *OGL_BatcherCache) -> bool {
     glBindTexture(GL_TEXTURE_BUFFER, cache.transform_texture);
     glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, cache.transform_buffer);
 
+    glGenBuffers(1, *cache.material_buffer);
+    glGenTextures(1, *cache.material_texture);
+    ogl_batcher_upload_buffer(cache.material_buffer, GL_TEXTURE_BUFFER, null, 256, *cache.material_buffer_capacity);
+    glActiveTexture(GL_TEXTURE0 + BATCHER_MAX_TEXTURE_COUNT + 2);
+    glBindTexture(GL_TEXTURE_BUFFER, cache.material_texture);
+    glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, cache.material_buffer);
     glUseProgram(cache.shader_program);
+    glUniform1i(glGetUniformLocation(cache.shader_program, "materials".data), BATCHER_MAX_TEXTURE_COUNT + 2);
     cache.projection_uniform = glGetUniformLocation(cache.shader_program, "projection".data);
-    cache.color_pack_mode_uniform = glGetUniformLocation(cache.shader_program, "color_pack_mode".data);
+    cache.first_triangle_uniform = glGetUniformLocation(cache.shader_program, "first_triangle".data);
     texture_units: [BATCHER_MAX_TEXTURE_COUNT] GLint;
     for i: 0..texture_units.count-1 {
         texture_units[i] = xx i;
@@ -107,6 +114,8 @@ ogl_destroy_batcher :: (cache: *OGL_BatcherCache) {
     glDeleteBuffers(1, *cache.index_buffer);
     glDeleteBuffers(1, *cache.per_triangle_buffer);
     glDeleteBuffers(1, *cache.transform_buffer);
+    glDeleteBuffers(1, *cache.material_buffer);
+    glDeleteTextures(1, *cache.material_texture);
     glDeleteTextures(1, *cache.per_triangle_texture);
     glDeleteTextures(1, *cache.transform_texture);
     if cache.shader_program != 0 {
@@ -122,24 +131,23 @@ ogl_destroy_batcher :: (cache: *OGL_BatcherCache) {
 
 // The caller supplies its camera's matrix, keeping the module independent of application render types.
 ogl_render_batcher :: (cache: *OGL_BatcherCache, batcher: *Batcher, view_projection: *Mat4) {
-    if batcher.indices.count <= 0 {
+    if get_batcher_index_count(batcher) <= 0 {
         return;
     }
     assert(cache.vao != 0 && cache.shader_program != 0, "Initialize the batcher cache before rendering.");
     triangle_data, triangle_data_bytes, triangle_count := get_batcher_triangle_data(batcher);
-    color_pack_mode := get_batcher_color_pack_mode(batcher);
-    assert(batcher.indices.count % 3 == 0 && triangle_count == batcher.indices.count / 3);
+    assert(get_batcher_index_count(batcher) % 3 == 0 && triangle_count == get_batcher_index_count(batcher) / 3);
     #assert size_of(BatcherObjectTransformData) == 4 * size_of(float);
+    #assert size_of(BatcherMaterial) == 4 * size_of(float);
 
     glBindVertexArray(cache.vao);
     ogl_batcher_upload_buffer(
         cache.vertex_buffer, GL_ARRAY_BUFFER, batcher.vertices.data,
         batcher.vertices.count * size_of(BatcherVertex), *cache.vertex_buffer_capacity
     );
-    ogl_batcher_upload_buffer(
-        cache.index_buffer, GL_ELEMENT_ARRAY_BUFFER, batcher.indices.data,
-        batcher.indices.count * size_of(u32), *cache.index_buffer_capacity
-    );
+    ogl_upload_batcher_indices(cache.index_buffer, batcher, *cache.index_buffer_capacity);
+    ogl_batcher_upload_buffer(cache.material_buffer, GL_TEXTURE_BUFFER, batcher.materials.data,
+                             batcher.materials.count * size_of(BatcherMaterial), *cache.material_buffer_capacity);
     ogl_batcher_upload_buffer(
         cache.per_triangle_buffer, GL_TEXTURE_BUFFER, triangle_data,
         triangle_data_bytes, *cache.per_triangle_buffer_capacity
@@ -151,18 +159,11 @@ ogl_render_batcher :: (cache: *OGL_BatcherCache, batcher: *Batcher, view_project
     );
 
     glUseProgram(cache.shader_program);
-    glUniformMatrix4fv(cache.projection_uniform, 1, GL_TRUE, *view_projection._00);
-    glUniform1i(cache.color_pack_mode_uniform, xx color_pack_mode);
+    glUniformMatrix4fv(cache.projection_uniform, 1, GL_TRUE, view_projection.e.data);
     glActiveTexture(GL_TEXTURE0 + BATCHER_MAX_TEXTURE_COUNT);
     glBindTexture(GL_TEXTURE_BUFFER, cache.per_triangle_texture);
-    if cache.color_pack_mode != color_pack_mode {
-        format: GLenum = GL_RGBA32UI;
-        if color_pack_mode == .PACK_U32 {
-            format = GL_RG32UI;
-        }
-        glTexBuffer(GL_TEXTURE_BUFFER, format, cache.per_triangle_buffer);
-        cache.color_pack_mode = color_pack_mode;
-    }
+    glActiveTexture(GL_TEXTURE0 + BATCHER_MAX_TEXTURE_COUNT + 2);
+    glBindTexture(GL_TEXTURE_BUFFER, cache.material_texture);
     glActiveTexture(GL_TEXTURE0 + BATCHER_MAX_TEXTURE_COUNT + 1);
     glBindTexture(GL_TEXTURE_BUFFER, cache.transform_texture);
     for texture_index: 0..batcher.num_textures-1 {
@@ -171,10 +172,94 @@ ogl_render_batcher :: (cache: *OGL_BatcherCache, batcher: *Batcher, view_project
     }
 
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDrawElements(GL_TRIANGLES, xx batcher.indices.count, GL_UNSIGNED_INT, null);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    ogl_draw_batcher_ranges(batcher, cache.first_triangle_uniform, view_projection);
     glDisable(GL_BLEND);
     glBindVertexArray(0);
+}
+
+// Upload clip buckets contiguously; ranges retain the original primitive-data offsets.
+ogl_upload_batcher_indices :: (buffer: u32, batcher: *Batcher, capacity: *int) {
+    ogl_batcher_upload_buffer(buffer, GL_ELEMENT_ARRAY_BUFFER, null, get_batcher_index_count(batcher) * size_of(u32), capacity);
+    offset: int;
+    for indices: batcher.indices_array {
+        bytes := indices.count * size_of(u32);
+        if bytes > 0 {
+            glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, offset, bytes, indices.data);
+        }
+        offset += bytes;
+    }
+    assert(offset == get_batcher_index_count(batcher) * size_of(u32));
+}
+
+// Clip rects use geometry coordinates; map all four corners to the current GL viewport.
+// Scissor is axis-aligned, so callers should use an axis-aligned 2D projection for exact clipping.
+ogl_draw_batcher_ranges :: (batcher: *Batcher, first_triangle_uniform: s32, projection: *Mat4) -> (draws: int, triangles: int) {
+    viewport, saved_scissor: [4]GLint;
+    glGetIntegerv(GL_VIEWPORT, viewport.data);
+    glGetIntegerv(GL_SCISSOR_BOX, saved_scissor.data);
+    had_scissor := glIsEnabled(GL_SCISSOR_TEST);
+    offsets: [MAX_CLIP_RECTS]int;
+    for i: 1..MAX_CLIP_RECTS - 1 {
+        offsets[i] = offsets[i - 1] + batcher.indices_array[i - 1].count;
+    }
+    draws, triangles: int;
+    for range: batcher.draw_ranges {
+        clip := range.clip_rect_index;
+        x0 := viewport[0];
+        y0 := viewport[1];
+        x1 := x0 + viewport[2];
+        y1 := y0 + viewport[3];
+        if clip != 0 {
+            rect := batcher.clip_rects_array[clip].actual;
+            if rect.radius.x <= 0.0 || rect.radius.y <= 0.0 {
+                continue;
+            }
+            minimum := Vec2.{1.0e30, 1.0e30};
+            maximum := -minimum;
+            for point: rect_get_points(rect) {
+                projected := projection.* * Vec4.{point.x, point.y, 0.0, 1.0};
+                ndc := projected.xy / projected.w;
+                pixel := Vec2.{cast(float)viewport[0], cast(float)viewport[1]}
+                    + (ndc * 0.5 + Vec2.{0.5, 0.5}) * Vec2.{cast(float)viewport[2], cast(float)viewport[3]};
+                minimum = min(minimum, pixel);
+                maximum = max(maximum, pixel);
+            }
+            x0 = max(x0, cast(s32)floor(minimum.x));
+            y0 = max(y0, cast(s32)floor(minimum.y));
+            x1 = min(x1, cast(s32)ceil(maximum.x));
+            y1 = min(y1, cast(s32)ceil(maximum.y));
+        }
+        if had_scissor {
+            x0 = max(x0, saved_scissor[0]);
+            y0 = max(y0, saved_scissor[1]);
+            x1 = min(x1, saved_scissor[0] + saved_scissor[2]);
+            y1 = min(y1, saved_scissor[1] + saved_scissor[3]);
+        }
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        if clip != 0 || had_scissor {
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(x0, y0, xx (x1 - x0), xx (y1 - y0));
+        } else {
+            glDisable(GL_SCISSOR_TEST);
+        }
+        MAX_GL_DRAW_INDICES :: 0x7fffffff;
+        assert(range.index_count <= MAX_GL_DRAW_INDICES && range.first_triangle <= MAX_GL_DRAW_INDICES);
+        glUniform1i(first_triangle_uniform, xx range.first_triangle);
+        byte_offset := (offsets[clip] + range.first_index) * size_of(u32);
+        glDrawElements(GL_TRIANGLES, xx range.index_count, GL_UNSIGNED_INT, cast(*void)byte_offset);
+        draws += 1;
+        triangles += range.index_count / 3;
+    }
+    glScissor(saved_scissor[0], saved_scissor[1], xx saved_scissor[2], xx saved_scissor[3]);
+    if had_scissor {
+        glEnable(GL_SCISSOR_TEST);
+    } else {
+        glDisable(GL_SCISSOR_TEST);
+    }
+    return draws, triangles;
 }
 
 #scope_module
@@ -265,25 +350,44 @@ void main()
 
 BATCHER_VS;
 
-OGL_BATCHER_FRAGMENT_SHADER :: #run sprint(
-    "#version 330 core\n%\n%", PACKED_COLOR_GLSL, OGL_BATCHER_FRAGMENT_BODY
-);
+OGL_BATCHER_FRAGMENT_SHADER :: #string BATCHER_FS
 
-#scope_module
-OGL_BATCHER_FRAGMENT_BODY :: #string BATCHER_FS
+#version 330 core
 
 in vec2 vs_uv;
 out vec4 color;
 
 uniform sampler2D textures[14];
 uniform usamplerBuffer per_triangle_data;
-uniform int color_pack_mode;
+uniform int first_triangle;
+uniform samplerBuffer materials;
+
+// RG32UI triangle records: flags/material index, then straight sRGB RGBA8 tint.
+vec4 unpack_batcher_color(uvec4 triangle_data)
+{
+    uint value = triangle_data.y;
+    vec4 tint = vec4(float(value & 255u), float((value >> 8u) & 255u),
+                     float((value >> 16u) & 255u), float(value >> 24u)) / 255.0;
+    tint.rgb = mix(tint.rgb / 12.92, pow((tint.rgb + 0.055) / 1.055, vec3(2.4)),
+                   step(vec3(0.04045), tint.rgb));
+    tint.rgb *= tint.a;
+    return tint;
+}
 
 void main()
 {
-    uvec4 triangle_data = texelFetch(per_triangle_data, gl_PrimitiveID);
+    uvec4 triangle_data = texelFetch(per_triangle_data, first_triangle + gl_PrimitiveID);
+
     uint packed_data = triangle_data.r;
-    color = unpack_batcher_color(triangle_data, color_pack_mode);
+    color = unpack_batcher_color(triangle_data);
+
+    uint material_index = packed_data >> 16u;
+    if (material_index != 0xffffu) {
+        vec4 material_hdr_color = texelFetch(materials, int(material_index));
+        vec4 material_hdr_color_premultiplied = vec4(material_hdr_color.rgb * material_hdr_color.a, material_hdr_color.a);
+        color *= material_hdr_color_premultiplied;
+    }
+
     uint texture_index = packed_data & 15u;
     uint aa_nearest_neighbour = (packed_data >> 4u) & 1u;
 

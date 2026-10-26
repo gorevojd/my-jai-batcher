@@ -1,3 +1,7 @@
+// Drawing colors are straight (non-premultiplied) sRGB tints. The shader decodes
+// them to linear RGB and premultiplies alpha. Textures must already contain linear,
+// premultiplied RGBA. HDR linear colors are supplied separately through materials.
+
 BatcherTextureFlags :: enum_flags u32 {
     ANTIALIAS_NEAREST_NEIGHBOUR;
 }
@@ -15,37 +19,34 @@ BatcherVertex :: struct {
     transform_index: u32;
 }
 
-ColorPackMode :: enum u32 {
-    PACK_U32;
-    PACK_U64;
-}
-
-BatcherPerTriangleDataU32 :: struct {
-    // Same flags as BatcherPerTriangleData; linear RGBA8 occupies the second word.
+// Packed sRGB tint: RGB is decoded and alpha premultiplied in the shader.
+BatcherPerTriangleData :: struct {
+    // Bits 0..3: texture (15 = none), bit 4: AA nearest, bits 16..31: material.
     packed_data: u32;
     packed_color: u32;
 }
 
-BatcherPerTriangleData :: struct {
-    /*
-        Bits 0..3: texture index, or 15 for untextured triangles.
-        Bit 4: `anti_alias_nearest_neighbour` flag.
-        Bits 5..31 are zero.
-    */
-    packed_data: u32;
-    // Explicit padding keeps the GPU ABI stable: one RGBA32UI texel per triangle.
-    reserved: u32;
-    // R19/G19/B18 unsigned floats and A8 coverage, packed by MyMath.
-    packed_color: u64;
+#assert size_of(BatcherPerTriangleData) == 8;
+#assert type_info(BatcherPerTriangleData).members[1].offset_in_bytes == 4;
+
+BatcherMaterial :: struct {
+    // Straight linear HDR; the shader premultiplies alpha when applying the material.
+    hdr_linear_color: Linear_Color = .{1.0, 1.0, 1.0, 1.0};
 }
 
-#assert size_of(BatcherPerTriangleData) == 16;
-#assert type_info(BatcherPerTriangleData).members[0].offset_in_bytes == 0;
-#assert type_info(BatcherPerTriangleData).members[1].offset_in_bytes == 4;
-#assert type_info(BatcherPerTriangleData).members[2].offset_in_bytes == 8;
-#assert size_of(BatcherPerTriangleDataU32) == 8;
-#assert type_info(BatcherPerTriangleDataU32).members[0].offset_in_bytes == 0;
-#assert type_info(BatcherPerTriangleDataU32).members[1].offset_in_bytes == 4;
+BatcherClipRect :: struct {
+    original: Rect;
+    actual: Rect;
+}
+
+// Preserve painter order across nested clips, including a parent resumed after pop.
+BatcherDrawRange :: struct {
+    clip_rect_index: u32;
+    first_index, index_count, first_triangle: int;
+}
+
+MAX_CLIP_RECTS :: 16; // Includes slot 0, the unclipped root.
+NOT_SET_MATERIAL :: 0xFFFF;
 
 BatcherObjectTransformData :: struct {
     position: Vec2;
@@ -53,15 +54,16 @@ BatcherObjectTransformData :: struct {
 }
 
 Batcher :: struct {
-    // Configure before begin_batcher_frame. A change applies at the next frame reset.
-    color_pack_mode: ColorPackMode = .PACK_U64;
-    frame_color_pack_mode: ColorPackMode = .PACK_U64;
-
     vertices: [..] BatcherVertex;
-    indices: [..] u32;
-
+    indices_array: [MAX_CLIP_RECTS] [..] u32;
+    clip_rects_array: [MAX_CLIP_RECTS] BatcherClipRect;
+    clip_rects_stack: [MAX_CLIP_RECTS] u32;
+    clip_rects_count: int;
+    clip_rects_stack_count: int;
+    draw_ranges: [..] BatcherDrawRange;
+    materials: [..] BatcherMaterial;
+    currently_active_material: u32 = NOT_SET_MATERIAL;
     per_triangle_data: [..] BatcherPerTriangleData;
-    per_triangle_data_u32: [..] BatcherPerTriangleDataU32;
     object_transform_data: [..] BatcherObjectTransformData;
 
     textures: [BATCHER_MAX_TEXTURE_COUNT] u64;
@@ -73,56 +75,103 @@ BATCHER_INVALID_TEXTURE_INDEX :: 15;
 BATCHER_IDENTITY_TRANSFORM_INDEX :: 0;
 
 begin_batcher_frame :: (batcher: *Batcher, estimated_num_quads: int, allocator: Allocator = temp) {
-    assert(batcher.color_pack_mode == .PACK_U32 || batcher.color_pack_mode == .PACK_U64);
-    batcher.frame_color_pack_mode = batcher.color_pack_mode;
     batcher.vertices.allocator = allocator;
-    batcher.indices.allocator = allocator;
     batcher.per_triangle_data.allocator = allocator;
-    batcher.per_triangle_data_u32.allocator = allocator;
     batcher.object_transform_data.allocator = allocator;
-
+    batcher.draw_ranges.allocator = allocator;
+    batcher.materials.allocator = allocator;
+    for *indices: batcher.indices_array {
+        indices.allocator = allocator;
+        array_reset(indices);
+    }
     array_reset(*batcher.vertices);
-    array_reset(*batcher.indices);
     array_reset(*batcher.per_triangle_data);
-    array_reset(*batcher.per_triangle_data_u32);
     array_reset(*batcher.object_transform_data);
-
-    estimated_num_vertices := estimated_num_quads * 4;
-    array_reserve(*batcher.vertices, estimated_num_vertices);
-    array_reserve(*batcher.indices, estimated_num_quads * 6);
-    reserve_batcher_triangle_data(batcher, estimated_num_quads * 2);
+    array_reset(*batcher.draw_ranges);
+    array_reset(*batcher.materials);
+    batcher.clip_rects_count = 1;
+    batcher.clip_rects_stack_count = 1;
+    batcher.clip_rects_stack[0] = 0;
+    batcher.currently_active_material = NOT_SET_MATERIAL;
+    array_reserve(*batcher.vertices, estimated_num_quads * 4);
+    array_reserve(*batcher.indices_array[0], estimated_num_quads * 6);
+    array_reserve(*batcher.per_triangle_data, estimated_num_quads * 2);
     array_reserve(*batcher.object_transform_data, estimated_num_quads);
-    // World-space geometry shares one identity transform for the entire frame.
     array_add(*batcher.object_transform_data, .{});
-
-    for texture_index: 0..batcher.textures.count-1 {
-        batcher.textures[texture_index] = 0;
+    for *texture: batcher.textures {
+        texture.* = 0;
     }
     batcher.num_textures = 0;
 }
 
-get_batcher_color_pack_mode :: (batcher: *Batcher) -> ColorPackMode {
-    return batcher.frame_color_pack_mode;
-}
-
-get_batcher_triangle_stride :: (mode: ColorPackMode) -> int {
-    if mode == .PACK_U32 {
-        return size_of(BatcherPerTriangleDataU32);
+free_batcher :: (batcher: *Batcher) {
+    array_free(batcher.vertices);
+    for *indices: batcher.indices_array {
+        array_free(indices.*);
     }
-    assert(mode == .PACK_U64);
-    return size_of(BatcherPerTriangleData);
+    array_free(batcher.per_triangle_data);
+    array_free(batcher.object_transform_data);
+    array_free(batcher.draw_ranges);
+    array_free(batcher.materials);
+    batcher.* = .{};
 }
 
-// Raw records for GPU upload. Only the array selected at begin_batcher_frame is populated.
+get_batcher_index_count :: (batcher: *Batcher) -> int {
+    return batcher.per_triangle_data.count * 3;
+}
+
 get_batcher_triangle_data :: (batcher: *Batcher) -> (data: *void, byte_count: int, triangle_count: int) {
-    if batcher.frame_color_pack_mode == .PACK_U32 {
-        assert(batcher.per_triangle_data.count == 0);
-        count := batcher.per_triangle_data_u32.count;
-        return batcher.per_triangle_data_u32.data, count * size_of(BatcherPerTriangleDataU32), count;
-    }
-    assert(batcher.per_triangle_data_u32.count == 0);
     count := batcher.per_triangle_data.count;
     return batcher.per_triangle_data.data, count * size_of(BatcherPerTriangleData), count;
+}
+
+current_clip_rect_index :: (batcher: *Batcher) -> u32 {
+    assert(batcher.clip_rects_stack_count > 0, "Begin a batcher frame before drawing.");
+    return batcher.clip_rects_stack[batcher.clip_rects_stack_count - 1];
+}
+
+// Rectangles are in the same coordinate system as submitted geometry, before projection.
+push_clip_rect :: (batcher: *Batcher, rect: Rect) {
+    assert(rect.radius.x >= 0.0 && rect.radius.y >= 0.0);
+    assert(batcher.clip_rects_count < MAX_CLIP_RECTS, "Too many clip rectangles in this frame.");
+    assert(batcher.clip_rects_stack_count < MAX_CLIP_RECTS, "Clip stack overflow.");
+    parent := current_clip_rect_index(batcher);
+    actual := rect;
+    if parent != 0 {
+        outer := batcher.clip_rects_array[parent].actual;
+        minimum := max(rect_min(rect), rect_min(outer));
+        maximum := max(minimum, min(rect_max(rect), rect_max(outer)));
+        actual = rect_min_max(minimum, maximum);
+    }
+    index := batcher.clip_rects_count;
+    batcher.clip_rects_count += 1;
+    batcher.clip_rects_array[index] = .{original = rect, actual = actual};
+    batcher.clip_rects_stack[batcher.clip_rects_stack_count] = xx index;
+    batcher.clip_rects_stack_count += 1;
+}
+
+pop_clip_rect :: (batcher: *Batcher) {
+    assert(batcher.clip_rects_stack_count > 1, "Clip stack underflow.");
+    batcher.clip_rects_stack_count -= 1;
+}
+
+begin_use_material :: (batcher: *Batcher, material: BatcherMaterial) {
+    assert(batcher.currently_active_material == NOT_SET_MATERIAL, "End the active material before beginning another.");
+    // Reuse identical values across glyphs and primitives without losing HDR precision.
+    for existing, index: batcher.materials {
+        if memcmp(*existing.hdr_linear_color, *material.hdr_linear_color, size_of(Linear_Color)) == 0 {
+            batcher.currently_active_material = xx index;
+            return;
+        }
+    }
+    assert(batcher.materials.count < NOT_SET_MATERIAL, "Batcher material capacity exceeded.");
+    batcher.currently_active_material = xx batcher.materials.count;
+    array_add(*batcher.materials, material);
+}
+
+end_use_material :: (batcher: *Batcher) {
+    assert(batcher.currently_active_material != NOT_SET_MATERIAL, "No material is active.");
+    batcher.currently_active_material = NOT_SET_MATERIAL;
 }
 
 register_texture :: (batcher: *Batcher, texture: u64) -> u8 {
@@ -156,41 +205,21 @@ register_texture :: (batcher: *Batcher, texture: u64) -> u8 {
 
 #scope_module
 
-reserve_batcher_triangle_data :: (batcher: *Batcher, count: int) {
-    if batcher.frame_color_pack_mode == .PACK_U32 {
-        array_reserve(*batcher.per_triangle_data_u32, count);
-    } else {
-        array_reserve(*batcher.per_triangle_data, count);
-    }
-}
-
-append_batcher_triangle_data :: (
-    batcher: *Batcher,
-    color: Linear_Color,
-    texture_index: u8,
-    anti_alias_nearest_neighbour: bool,
-    count: int = 1
-) {
+append_batcher_triangle_data :: (batcher: *Batcher, color: Color, texture_index: u8, anti_alias_nearest_neighbour: bool, count: int = 1) {
     assert(texture_index < BATCHER_MAX_TEXTURE_COUNT || texture_index == BATCHER_INVALID_TEXTURE_INDEX);
-    texture_bits := cast(u32) texture_index;
-    aa_bits := cast(u32) anti_alias_nearest_neighbour;
-    flags := texture_bits | (aa_bits << 4);
-    if batcher.frame_color_pack_mode == .PACK_U32 {
-        data: BatcherPerTriangleDataU32 = .{
-            packed_data = flags,
-            packed_color = pack_rgba_to_u32(color)
-        };
-        for 0..count-1 {
-            array_add(*batcher.per_triangle_data_u32, data);
-        }
+    texture_bits := cast(u32)texture_index;
+    aa_bits := cast(u32)anti_alias_nearest_neighbour;
+    flags := texture_bits | (aa_bits << 4) | (batcher.currently_active_material << 16);
+    clip := current_clip_rect_index(batcher);
+    first_index := batcher.indices_array[clip].count - count * 3;
+    if batcher.draw_ranges.count > 0 && batcher.draw_ranges[batcher.draw_ranges.count - 1].clip_rect_index == clip {
+        batcher.draw_ranges[batcher.draw_ranges.count - 1].index_count += count * 3;
     } else {
-        data: BatcherPerTriangleData = .{
-            packed_data = flags,
-            packed_color = pack_rgba_to_u64(color)
-        };
-        for 0..count-1 {
-            array_add(*batcher.per_triangle_data, data);
-        }
+        array_add(*batcher.draw_ranges, .{clip, first_index, count * 3, batcher.per_triangle_data.count});
+    }
+    data: BatcherPerTriangleData = .{packed_data = flags, packed_color = color.rgba};
+    for 0..count - 1 {
+        array_add(*batcher.per_triangle_data, data);
     }
 }
 
@@ -198,7 +227,7 @@ append_batcher_triangle_data :: (
 push_quad_manual :: (batcher: *Batcher,
                      ps: [] BatcherVertex,
                      transform_index: u32,
-                     color: Linear_Color,
+                     color: Color,
                      texture_index: u8 = xx BATCHER_INVALID_TEXTURE_INDEX,
                      texture_flags: BatcherTextureFlags = 0)
 {
@@ -209,7 +238,7 @@ push_quad_manual :: (batcher: *Batcher,
         vertex.transform_index = transform_index;
         array_add(*batcher.vertices, vertex);
     }
-    array_add(*batcher.indices,
+    array_add(*batcher.indices_array[current_clip_rect_index(batcher)],
               num_before + 0,
               num_before + 1,
               num_before + 2,
@@ -235,18 +264,11 @@ get_quad_vertex_data_for_rect_points :: inline (points: [] Vec2) -> [4] BatcherV
 }
 
 #scope_export
-register_transform :: inline (
-    batcher: *Batcher, position: Vec2, rotation: float, scale: float = 1.0
-) -> u32 {
+register_transform :: inline (batcher: *Batcher, position: Vec2, rotation: float, scale: float = 1.0) -> u32 {
     return register_transform(batcher, position, complex_from_angle(rotation), scale);
 }
 
-register_transform :: inline (
-    batcher: *Batcher,
-    position: Vec2,
-    rotation: Complex,
-    scale: float = 1.0
-) -> u32 {
+register_transform :: inline (batcher: *Batcher, position: Vec2, rotation: Complex, scale: float = 1.0) -> u32 {
     result := cast(u32) batcher.object_transform_data.count;
 
     transform_data: BatcherObjectTransformData = .{position=position, scaled_rotation=rotation * scale};
@@ -259,7 +281,7 @@ register_transform :: inline (
 push_polygon_internal :: (batcher: *Batcher,
                           ps: [4] Vec2,
                           transform_index: u32,
-                          color: Linear_Color = .{1.0, 1.0, 1.0, 1.0},
+                          color: Color = Colors.WHITE,
                           texture_index: u8 = xx BATCHER_INVALID_TEXTURE_INDEX,
                           texture_flags: BatcherTextureFlags = 0) #no_abc
 {
@@ -267,32 +289,18 @@ push_polygon_internal :: (batcher: *Batcher,
     push_quad_manual(batcher, quad_data, transform_index, color, texture_index, texture_flags);
 }
 
-push_triangle_internal :: (
-    batcher: *Batcher,
-    p0: Vec2,
-    p1: Vec2,
-    p2: Vec2,
-    transform_index: u32,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}
-) {
+push_triangle_internal :: (batcher: *Batcher, p0: Vec2, p1: Vec2, p2: Vec2, transform_index: u32, color: Color = Colors.WHITE) {
     base_vertex := cast(u32) batcher.vertices.count;
     vertices := BatcherVertex.[.{point = p0, transform_index = transform_index},
                               .{point = p1, transform_index = transform_index},
                               .{point = p2, transform_index = transform_index}];
     array_add(*batcher.vertices, vertices[0], vertices[1], vertices[2]);
-    array_add(*batcher.indices, base_vertex, base_vertex + 1, base_vertex + 2);
+    array_add(*batcher.indices_array[current_clip_rect_index(batcher)], base_vertex, base_vertex + 1, base_vertex + 2);
 
     append_batcher_triangle_data(batcher, color, xx BATCHER_INVALID_TEXTURE_INDEX, false);
 }
 
-push_outline_internal :: (
-    batcher: *Batcher,
-    points: [] Vec2,
-    points_count: int,
-    thickness: float,
-    transform_index: u32,
-    color: Linear_Color
-) {
+push_outline_internal :: (batcher: *Batcher, points: [] Vec2, points_count: int, thickness: float, transform_index: u32, color: Color) {
     MAX_POINTS_FOR_THIS_ALGO :: 128;
     helper_normal_holder: [MAX_POINTS_FOR_THIS_ALGO] Vec2;
     helper_avg_normal_holder: [MAX_POINTS_FOR_THIS_ALGO] Vec2;
@@ -343,7 +351,7 @@ push_outline_internal :: (
 #scope_export
 push_polygon :: (batcher: *Batcher,
                  ps: [4] Vec2,
-                 color: Linear_Color = .{1.0, 1.0, 1.0, 1.0},
+                 color: Color = Colors.WHITE,
                  texture_index: u8 = xx BATCHER_INVALID_TEXTURE_INDEX,
                  texture_flags: BatcherTextureFlags = 0) #no_abc
 {
@@ -352,12 +360,7 @@ push_polygon :: (batcher: *Batcher,
     );
 }
 
-push_mesh_2d :: (
-    batcher: *Batcher,
-    mesh: Mesh2D,
-    transform: Transform2D,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}
-) {
+push_mesh_2d :: (batcher: *Batcher, mesh: Mesh2D, transform: Transform2D, color: Color = Colors.WHITE) {
     triangle_count := get_mesh_triangle_count(mesh);
     if triangle_count == 0 {
         return;
@@ -367,9 +370,10 @@ push_mesh_2d :: (
     vertex_count := mesh.vertices.count;
 
     array_reserve(*batcher.vertices, batcher.vertices.count + vertex_count);
-    array_reserve(*batcher.indices, batcher.indices.count + triangle_count * 3);
-    existing_triangle_count := batcher.indices.count / 3;
-    reserve_batcher_triangle_data(batcher, existing_triangle_count + triangle_count);
+    indices := *batcher.indices_array[current_clip_rect_index(batcher)];
+    array_reserve(indices, indices.count + triangle_count * 3);
+    existing_triangle_count := batcher.per_triangle_data.count;
+    array_reserve(*batcher.per_triangle_data, existing_triangle_count + triangle_count);
     transform_index := register_transform(batcher, transform.position, transform.rotation, transform.scale);
 
     // Copy vertices directly into the batcher
@@ -381,68 +385,45 @@ push_mesh_2d :: (
     // Copy shifted indices directly into the batcher
     if mesh.indices.count > 0 {
         for i: 0..mesh.indices.count - 1 {
-            array_add(*batcher.indices, base_vertex + mesh.indices[i]);
+            array_add(*batcher.indices_array[current_clip_rect_index(batcher)], base_vertex + mesh.indices[i]);
         }
     } else {
         for i: 0..vertex_count-1 {
-            array_add(*batcher.indices, base_vertex + cast(u32) i);
+            array_add(*batcher.indices_array[current_clip_rect_index(batcher)], base_vertex + cast(u32) i);
         }
     }
 
     append_batcher_triangle_data(batcher, color, xx BATCHER_INVALID_TEXTURE_INDEX, false, triangle_count);
 }
 
-push_quad :: (
-    batcher: *Batcher,
-    position: Vec2,
-    size: float = 1.0,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}
-) {
+push_quad :: (batcher: *Batcher, position: Vec2, size: float = 1.0, color: Color = Colors.WHITE) {
     rect_points := #run rect_get_points(rect_center_dim(Vec2.{}, Vec2.{1.0, 1.0}));
 
     quad_data := get_quad_vertex_data_for_rect_points(rect_points);
     push_quad_manual(batcher, quad_data, register_transform(batcher, position, 0.0, size), color);
 }
 
-push_rect :: (
-    batcher: *Batcher,
-    position: Vec2,
-    rotation: Complex,
-    size: Vec2,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}
-) {
+push_rect :: (batcher: *Batcher, position: Vec2, rotation: Complex, size: Vec2, color: Color = Colors.WHITE) {
     rect_points := rect_get_points(rect_center_dim(Vec2.{}, size));
 
     quad_data := get_quad_vertex_data_for_rect_points(rect_points);
     push_quad_manual(batcher, quad_data, register_transform(batcher, position, rotation), color);
 }
 
-push_rect :: (batcher: *Batcher, rect: Rect, color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}) {
+push_rect :: (batcher: *Batcher, rect: Rect, color: Color = Colors.WHITE) {
     rect_points := rect_get_points(.{radius = rect.radius});
     quad_data := get_quad_vertex_data_for_rect_points(rect_points);
     push_quad_manual(batcher, quad_data, register_transform(batcher, rect.center, 0.0), color);
 }
 
-push_rotated_rect_outline :: (batcher: *Batcher,
-                              position: Vec2,
-                              rotation: Complex,
-                              size: Vec2,
-                              outline_thickness: float,
-                              color: Linear_Color = .{1.0, 1.0, 1.0, 1.0})
-{
+push_rotated_rect_outline :: (batcher: *Batcher, position: Vec2, rotation: Complex, size: Vec2, outline_thickness: float, color: Color = Colors.WHITE) {
     rect_points := rect_get_points(rect_center_dim(Vec2.{}, size));
 
     transform_index := register_transform(batcher, position, rotation);
     push_outline_internal(batcher, rect_points, 4, outline_thickness, transform_index, color);
 }
 
-push_texture :: (batcher: *Batcher,
-                 texture: BatcherTexture,
-                 position: Vec2,
-                 height: float,
-                 align: Vec2 = .{0.5, 0.5},
-                 color: Linear_Color = .{1.0, 1.0, 1.0, 1.0})
-{
+push_texture :: (batcher: *Batcher, texture: BatcherTexture, position: Vec2, height: float, align: Vec2 = .{0.5, 0.5}, color: Color = Colors.WHITE) {
     push_rotated_texture(batcher, texture, position, height, 0.0, align, color);
 }
 
@@ -452,7 +433,7 @@ push_rotated_texture :: (batcher: *Batcher,
                          height: float,
                          rotation_angle: float = 0.0,
                          align: Vec2 = .{0.5, 0.5},
-                         color: Linear_Color = .{1.0, 1.0, 1.0, 1.0})
+                         color: Color = Colors.WHITE)
 {
     if texture.height == 0 || texture.width == 0 {
         return;
@@ -479,8 +460,7 @@ push_rotated_texture :: (batcher: *Batcher,
 }
 
 // Draw an atlas region (normalized UVs) on a local rectangle, transformed as one object.
-push_texture_region :: (batcher: *Batcher, texture: BatcherTexture, rect: Rect, uv_rect: Rect,
-                        transform: Transform2D, color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}) {
+push_texture_region :: (batcher: *Batcher, texture: BatcherTexture, rect: Rect, uv_rect: Rect, transform: Transform2D, color: Color = Colors.WHITE) {
     if texture.width == 0 || texture.height == 0 {
         return;
     }
@@ -499,13 +479,7 @@ push_texture_region :: (batcher: *Batcher, texture: BatcherTexture, rect: Rect, 
     push_quad_manual(batcher, vertices, transform_index, color, texture_index, texture.flags);
 }
 
-push_triangle :: (
-    batcher: *Batcher,
-    p0: Vec2,
-    p1: Vec2,
-    p2: Vec2,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}
-) {
+push_triangle :: (batcher: *Batcher, p0: Vec2, p1: Vec2, p2: Vec2, color: Color = Colors.WHITE) {
     push_triangle_internal(batcher, p0, p1, p2, BATCHER_IDENTITY_TRANSFORM_INDEX, color);
 }
 
@@ -515,7 +489,7 @@ push_circle_sector :: (batcher: *Batcher,
                        angle_end: float,
                        radius_inner: float,
                        radius_outer: float,
-                       color: Linear_Color = .{1.0, 1.0, 1.0, 1.0},
+                       color: Color = Colors.WHITE,
                        num_segments: int = 24)
 {
     if (is_nearly_zero(radius_outer) ||
@@ -552,35 +526,15 @@ push_circle_sector :: (batcher: *Batcher,
     }
 }
 
-push_circle :: (
-    batcher: *Batcher,
-    center: Vec2,
-    radius: float,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0},
-    num_segments: int = 24
-) {
+push_circle :: (batcher: *Batcher, center: Vec2, radius: float, color: Color = Colors.WHITE, num_segments: int = 24) {
     push_circle_sector(batcher, center, 0.0, TAU, 0.0, radius, color, num_segments);
 }
 
-push_circle_outline :: (
-    batcher: *Batcher,
-    center: Vec2,
-    radius: float,
-    outline_thickness: float,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0},
-    num_segments: int = 24
-) {
+push_circle_outline :: (batcher: *Batcher, center: Vec2, radius: float, outline_thickness: float, color: Color = Colors.WHITE, num_segments: int = 24) {
     push_circle_sector(batcher, center, 0.0, TAU, radius, radius + outline_thickness, color, num_segments);
 }
 
-push_capsule :: (
-    batcher: *Batcher,
-    a: Vec2,
-    b: Vec2,
-    radius: float,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0},
-    num_segments_of_half: int = 12
-) {
+push_capsule :: (batcher: *Batcher, a: Vec2, b: Vec2, radius: float, color: Color = Colors.WHITE, num_segments_of_half: int = 12) {
     if is_nearly_zero(radius) {
         return;
     }
@@ -616,15 +570,14 @@ push_capsule :: (
     );
 }
 
-push_capsule_outline :: (
-    batcher: *Batcher,
-    a: Vec2,
-    b: Vec2,
-    radius: float,
-    thickness: float,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0},
-    num_segments_of_half: int = 12
-) {
+push_capsule_outline :: (batcher: *Batcher,
+                         a: Vec2,
+                         b: Vec2,
+                         radius: float,
+                         thickness: float,
+                         color: Color = Colors.WHITE,
+                         num_segments_of_half: int = 12)
+{
     if equal(a, b) {
          push_circle_outline(batcher, a, radius, thickness, color, num_segments_of_half * 2);
          return;
@@ -660,13 +613,7 @@ push_capsule_outline :: (
 }
 
 #scope_module
-push_line_internal :: (
-    batcher: *Batcher,
-    a: Vec2,
-    b: Vec2,
-    thickness: float,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}
-) -> Vec2 {
+push_line_internal :: (batcher: *Batcher, a: Vec2, b: Vec2, thickness: float, color: Color = Colors.WHITE) -> Vec2 {
     if equal(a, b) {
         return Vec2.{};
     }
@@ -689,13 +636,7 @@ push_line_internal :: (
 }
 
 #scope_export
-push_line :: (
-    batcher: *Batcher,
-    a: Vec2,
-    b: Vec2,
-    thickness: float,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}
-) {
+push_line :: (batcher: *Batcher, a: Vec2, b: Vec2, thickness: float, color: Color = Colors.WHITE) {
     push_line_internal(batcher, a, b, thickness, color);
 }
 
@@ -704,7 +645,7 @@ push_line_with_arrows :: (batcher: *Batcher,
                           begin: Vec2,
                           end: Vec2,
                           line_thickness: float,
-                          color: Linear_Color = .{1.0, 1.0, 1.0, 1.0},
+                          color: Color = Colors.WHITE,
                           arrow_at_begin: bool = false,
                           arrow_at_end: bool = true,
                           arrowhead_length_percent: float = 400.0,
@@ -750,33 +691,15 @@ push_line_with_arrows :: (batcher: *Batcher,
     }
 }
 
-push_arrow :: (
-    batcher: *Batcher,
-    begin: Vec2,
-    end: Vec2,
-    line_thickness: float,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}
-) {
+push_arrow :: (batcher: *Batcher, begin: Vec2, end: Vec2, line_thickness: float, color: Color = Colors.WHITE) {
     push_line_with_arrows(batcher, begin, end, line_thickness, color);
 }
 
 // direction is a displacement: its magnitude determines the arrow's length.
-push_direction :: (
-    batcher: *Batcher,
-    pos: Vec2,
-    direction: Vec2,
-    line_thickness: float,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}
-) {
+push_direction :: (batcher: *Batcher, pos: Vec2, direction: Vec2, line_thickness: float, color: Color = Colors.WHITE) {
     push_arrow(batcher, pos, pos + direction, line_thickness, color);
 }
 
-push_rounded_line :: (
-    batcher: *Batcher,
-    a: Vec2,
-    b: Vec2,
-    thickness: float,
-    color: Linear_Color = .{1.0, 1.0, 1.0, 1.0}
-) {
+push_rounded_line :: (batcher: *Batcher, a: Vec2, b: Vec2, thickness: float, color: Color = Colors.WHITE) {
     push_capsule(batcher, a, b, thickness * 0.5, color, 8);
 }
