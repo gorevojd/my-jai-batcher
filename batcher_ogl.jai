@@ -244,7 +244,8 @@ ogl_draw_batcher_ranges :: (batcher: *Batcher, first_triangle_uniform: s32, proj
         if clip != 0 || had_scissor {
             glEnable(GL_SCISSOR_TEST);
             glScissor(x0, y0, xx (x1 - x0), xx (y1 - y0));
-        } else {
+        }
+        else {
             glDisable(GL_SCISSOR_TEST);
         }
         MAX_GL_DRAW_INDICES :: 0x7fffffff;
@@ -258,7 +259,8 @@ ogl_draw_batcher_ranges :: (batcher: *Batcher, first_triangle_uniform: s32, proj
     glScissor(saved_scissor[0], saved_scissor[1], xx saved_scissor[2], xx saved_scissor[3]);
     if had_scissor {
         glEnable(GL_SCISSOR_TEST);
-    } else {
+    }
+    else {
         glDisable(GL_SCISSOR_TEST);
     }
     return draws, triangles;

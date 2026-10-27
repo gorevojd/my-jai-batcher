@@ -193,10 +193,12 @@ register_texture :: (batcher: *Batcher, texture: u64) -> u8 {
             actual_texture_index = batcher.num_textures;
 
             batcher.num_textures += 1;
-        } else {
+        }
+        else {
             log("Batcher ERROR: Textures overlap. Skipping texture.", flags=.ERROR);
         }
-    } else {
+    }
+    else {
         actual_texture_index = found_texture_index;
     }
 
@@ -214,7 +216,8 @@ append_batcher_triangle_data :: (batcher: *Batcher, color: Color, texture_index:
     first_index := batcher.indices_array[clip].count - count * 3;
     if batcher.draw_ranges.count > 0 && batcher.draw_ranges[batcher.draw_ranges.count - 1].clip_rect_index == clip {
         batcher.draw_ranges[batcher.draw_ranges.count - 1].index_count += count * 3;
-    } else {
+    }
+    else {
         array_add(*batcher.draw_ranges, .{clip, first_index, count * 3, batcher.per_triangle_data.count});
     }
     data: BatcherPerTriangleData = .{packed_data = flags, packed_color = color.rgba};
@@ -387,7 +390,8 @@ push_mesh_2d :: (batcher: *Batcher, mesh: Mesh2D, transform: Transform2D, color:
         for i: 0..mesh.indices.count - 1 {
             array_add(*batcher.indices_array[current_clip_rect_index(batcher)], base_vertex + mesh.indices[i]);
         }
-    } else {
+    }
+    else {
         for i: 0..vertex_count-1 {
             array_add(*batcher.indices_array[current_clip_rect_index(batcher)], base_vertex + cast(u32) i);
         }
