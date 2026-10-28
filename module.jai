@@ -1,4 +1,4 @@
-#module_parameters () (IMPORT_OGL_IMPLEMENTATION := false);
+#module_parameters () (GRAPHICS_APIS := (#import "MyBasic").GraphicsApi.None);
 
 #scope_module
 #import "Basic";
@@ -7,7 +7,7 @@
 #scope_export
 #load "batcher.jai";
 
-#if IMPORT_OGL_IMPLEMENTATION {
+#if (GRAPHICS_APIS & .OpenGL) != .None {
     #scope_module
     #import "GL";
 
