@@ -1,4 +1,7 @@
-#module_parameters () (GRAPHICS_APIS := (#import "MyBasic").GraphicsApi.None);
+#module_parameters () (GRAPHICS_API: enum {
+                          None;
+                          OpenGL;
+                      } = .None);
 
 #scope_module
 #import "Basic";
@@ -7,7 +10,7 @@
 #scope_export
 #load "batcher.jai";
 
-#if (GRAPHICS_APIS & .OpenGL) != .None {
+#if GRAPHICS_API == .OpenGL {
     #scope_module
     #import "GL";
 
