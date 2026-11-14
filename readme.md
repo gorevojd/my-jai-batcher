@@ -24,6 +24,11 @@ Add the parent directories of this module and its dependencies to the compiler's
 module search path. Install the dependencies' own dependencies as documented in
 their READMEs.
 
+When bundled in my-jai-core, initialize the checkout with
+`git submodule update --init --recursive` and add the directory containing Core
+and Core itself to the search path (`Src/Modules` and `Src/Modules/my-jai-core`
+in PacCodex).
+
 Select the OpenGL backend at the executable entry point:
 
 ```jai
