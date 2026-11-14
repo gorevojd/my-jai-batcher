@@ -5,7 +5,7 @@
 
 #scope_module
 #import "Basic";
-#import "MyMath";
+#import "my-jai-math";
 
 #scope_export
 #load "batcher.jai";
