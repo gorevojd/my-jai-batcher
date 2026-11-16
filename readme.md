@@ -26,8 +26,8 @@ their READMEs.
 
 When bundled in my-jai-core, initialize the checkout with
 `git submodule update --init --recursive` and add the directory containing Core
-and Core itself to the search path (`Src/Modules` and `Src/Modules/my-jai-core`
-in PacCodex).
+and Core itself to the search path. For example, a checkout at
+`modules/my-jai-core` needs `modules` and `modules/my-jai-core` on that path.
 
 Select the OpenGL backend at the executable entry point:
 
